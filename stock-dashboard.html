@@ -111,7 +111,7 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
   </div>
 </div>
 <div class="content">
-  <div class="notice-box">📡 Finnhub API로 실시간 데이터 로드 중 — 5~10초 소요됩니다.</div>
+  <div class="notice-box">📡 실시간 데이터 로드 중 — 처음 로드 시 10~20초 소요됩니다.</div>
   <div class="ticker-row">
     <input class="ticker-input" id="tickerInput" placeholder="티커 (예: AAPL)" value="ASTS" maxlength="10" onkeydown="if(event.key==='Enter')loadStock()">
     <button class="go-btn" onclick="loadStock()">조회</button>
@@ -235,79 +235,97 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
 </div>
 
 <script>
-const API_KEY = 'd7n8p19r01qppri3vrq0d7n8p19r01qppri3vrqg';
-const BASE = 'https://finnhub.io/api/v1';
-const COLORS = {ASTS:'#4f8ef7',RDW:'#00d97e',MSTR:'#f0a500',POET:'#a78bfa'};
-const DEFAULT_TICKERS = ['ASTS','RDW','MSTR','POET'];
-let currentTicker='ASTS', currentTab='overview';
-let stockData={}, portWeights={ASTS:25,RDW:25,MSTR:25,POET:25};
+// ── API 설정 ──────────────────────────────────────────────────────────────────
+const FH_KEY = 'd7n8p19r01qppri3vrq0d7n8p19r01qppri3vrqg'; // Finnhub - 현재 시세
+const AV_KEY = 'demo'; // Alpha Vantage - 과거 데이터 (demo는 IBM만, 실제 키 필요시 교체)
+
+const COLORS={ASTS:'#4f8ef7',RDW:'#00d97e',MSTR:'#f0a500',POET:'#a78bfa'};
+const DEFAULT_TICKERS=['ASTS','RDW','MSTR','POET'];
+let currentTicker='ASTS',currentTab='overview';
+let stockData={},portWeights={ASTS:25,RDW:25,MSTR:25,POET:25};
 let chartInst=null;
 
-// ── Finnhub API ───────────────────────────────────────────────────────────────
-async function fhGet(path) {
-  const sep = path.includes('?') ? '&' : '?';
-  const r = await fetch(`${BASE}${path}${sep}token=${API_KEY}`);
-  if (!r.ok) throw new Error(`API 오류: ${r.status}`);
-  return r.json();
+// ── 데이터 소스: Finnhub(시세) + Stooq(과거 무료) ────────────────────────────
+async function fetchQuote(ticker) {
+  const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${ticker}&token=${FH_KEY}`);
+  if (!r.ok) throw new Error(`시세 조회 실패 (${r.status})`);
+  const d = await r.json();
+  if (!d.c) throw new Error(`${ticker} 시세 없음`);
+  return d;
+}
+
+async function fetchHistory(ticker) {
+  // Stooq - 무료, CORS 허용, 미국 주식 지원
+  const url = `https://stooq.com/q/d/l/?s=${ticker.toLowerCase()}.us&i=d`;
+  try {
+    const r = await fetch(url);
+    const text = await r.text();
+    const lines = text.trim().split('\n').slice(1); // 헤더 제거
+    const closes = [], dates = [];
+    for (const line of lines) {
+      const cols = line.split(',');
+      if (cols.length < 5) continue;
+      const close = parseFloat(cols[4]);
+      if (isNaN(close)) continue;
+      dates.push(cols[0]);
+      closes.push(close);
+    }
+    if (closes.length < 10) throw new Error('데이터 부족');
+    return { dates: dates.slice(-60), closes: closes.slice(-60) };
+  } catch(e) {
+    throw new Error(`과거 데이터 조회 실패: ${e.message}`);
+  }
 }
 
 async function fetchStock(ticker) {
   try {
-    // 1. 현재 시세
-    const quote = await fhGet(`/quote?symbol=${ticker}`);
-    if (!quote.c) throw new Error(`${ticker} 데이터 없음`);
+    // 1. 현재 시세 (Finnhub)
+    const quote = await fetchQuote(ticker);
+    const price  = quote.c;
+    const prev   = quote.pc;
+    const chgPct = (price - prev) / prev * 100;
 
-    // 2. 과거 캔들 (180일)
-    const to   = Math.floor(Date.now()/1000);
-    const from = to - 86400*180;
-    const candle = await fhGet(`/stock/candle?symbol=${ticker}&resolution=D&from=${from}&to=${to}`);
-    if (!candle.c || candle.s==='no_data') throw new Error(`${ticker} 캔들 데이터 없음`);
+    // 2. 과거 데이터 (Stooq)
+    let history = { dates: [], closes: [] };
+    let closes  = [];
+    try {
+      history = await fetchHistory(ticker);
+      closes  = history.closes;
+    } catch(e) {
+      // 과거 데이터 실패 시 현재가로 임시 배열 생성
+      closes = Array(60).fill(price);
+      history = { dates: [], closes };
+    }
 
-    // 3. 회사 정보
-    let profile={};
-    try { profile = await fhGet(`/stock/profile2?symbol=${ticker}`); } catch(e){}
+    // 3. 변동성 계산
+    const lr = [];
+    for (let i = 1; i < closes.length; i++)
+      lr.push(Math.log(closes[i] / Math.max(closes[i-1], 1e-10)));
+    const lm = lr.reduce((a,b)=>a+b,0) / lr.length;
+    const sd = Math.sqrt(lr.reduce((a,b)=>a+(b-lm)**2,0) / lr.length);
+    const sa = sd * Math.sqrt(252);
 
-    const closes = candle.c;
-    const dates  = candle.t.slice(-60).map(t=>new Date(t*1000).toISOString().slice(0,10));
-
-    const price   = quote.c;
-    const prev    = quote.pc || closes[closes.length-2] || price;
-    const chgPct  = (price-prev)/prev*100;
-    const high52  = quote.h || Math.max(...closes);
-    const low52   = quote.l || Math.min(...closes);
-
-    // 실제 52주 고/저
     const h52 = Math.max(...closes);
     const l52 = Math.min(...closes);
-    const pos52 = +((price-l52)/(h52-l52+1e-10)*100).toFixed(1);
-
-    // 변동성 계산
-    const lr=[];
-    for(let i=1;i<closes.length;i++) lr.push(Math.log(closes[i]/Math.max(closes[i-1],1e-10)));
-    const lm=lr.reduce((a,b)=>a+b,0)/lr.length;
-    const sd=Math.sqrt(lr.reduce((a,b)=>a+(b-lm)**2,0)/lr.length);
-    const sa=sd*Math.sqrt(252);
+    const pos52 = +((price - l52) / (h52 - l52 + 1e-10) * 100).toFixed(1);
 
     const mc    = monteCarlo(price, sd, 63, 300);
     const micro = detectMicro(closes, 5);
 
     const result = {
-      ticker, price:+price.toFixed(2), prev:+prev.toFixed(2),
-      chg:+(price-prev).toFixed(2), chg_pct:+chgPct.toFixed(2),
-      high52:+h52.toFixed(2), low52:+l52.toFixed(2), pos52,
-      name: profile.name||ticker, sector: profile.finnhubIndustry||'N/A',
-      mktcap: profile.marketCapitalization||0,
-      beta: profile.beta||1.0, target: price,
-      sigma_daily:+(sd*100).toFixed(3), sigma_annual:+(sa*100).toFixed(2),
-      monte_carlo:mc, micro_trends:micro,
-      history:{ dates, closes:closes.slice(-60).map(v=>+v.toFixed(2)) },
+      ticker, name: ticker,
+      price: +price.toFixed(2), prev: +prev.toFixed(2),
+      chg: +(price-prev).toFixed(2), chg_pct: +chgPct.toFixed(2),
+      high52: +h52.toFixed(2), low52: +l52.toFixed(2), pos52,
+      sigma_daily: +(sd*100).toFixed(3), sigma_annual: +(sa*100).toFixed(2),
+      monte_carlo: mc, micro_trends: micro, history,
       updated: new Date().toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}),
     };
-    stockData[ticker]=result;
-    document.getElementById('updatedTime').textContent=result.updated;
+    stockData[ticker] = result;
+    document.getElementById('updatedTime').textContent = result.updated;
     return result;
   } catch(e) {
-    stockData[ticker]={error:e.message,ticker};
+    stockData[ticker] = { error: e.message, ticker };
     return null;
   }
 }
@@ -443,16 +461,16 @@ function renderOverview(d){
       <div class="cm"><div class="cm-label">52주 최고</div><div class="cm-val">$${d.high52}</div></div>
       <div class="cm"><div class="cm-label">52주 최저</div><div class="cm-val">$${d.low52}</div></div>
       <div class="cm"><div class="cm-label">52주 위치</div><div class="cm-val">${d.pos52}%</div></div>
-      <div class="cm"><div class="cm-label">섹터</div><div class="cm-val" style="font-size:11px">${d.sector}</div></div>
+      <div class="cm"><div class="cm-label">전일 종가</div><div class="cm-val">$${d.prev}</div></div>
       <div class="cm"><div class="cm-label">연간 변동성</div><div class="cm-val">${d.sigma_annual}%</div></div>
-      <div class="cm"><div class="cm-label">시가총액</div><div class="cm-val">${fmtNum(d.mktcap*1e6)}</div></div>
+      <div class="cm"><div class="cm-label">일간 변동성</div><div class="cm-val">${d.sigma_daily}%</div></div>
     </div>
     <div class="bar52"><div class="bar52-fill" style="width:${d.pos52}%;background:${color}"></div></div>
   </div>`;
 }
 
 function renderChart(d){
-  if(!d.history)return;
+  if(!d.history||!d.history.closes.length)return;
   const color=COLORS[d.ticker]||'#4f8ef7';
   if(chartInst){chartInst.destroy();chartInst=null;}
   chartInst=new Chart(document.getElementById('priceChart'),{
@@ -547,19 +565,19 @@ function renderPortfolio(stocks){
   const w=DEFAULT_TICKERS.map(t=>portWeights[t]/100);
   const tw=w.reduce((a,b)=>a+b,0);
   const nw=w.map(x=>x/tw);
-  const pb=stocks.reduce((a,s,i)=>a+(s.beta||1)*nw[i],0);
+  const pb=stocks.reduce((a,s,i)=>a+1*nw[i],0);
   const ps=Math.sqrt(stocks.reduce((a,s,i)=>a+(s.sigma_daily*nw[i]/100)**2,0));
   const mc=monteCarlo(100,ps,63,500);
   const psa=(ps*Math.sqrt(252)*100).toFixed(2);
   document.getElementById('portfolio-content').innerHTML=`
   <div class="port-metrics">
-    <div class="metric-box"><div class="mb-label">포트폴리오 베타</div><div class="mb-val">${pb.toFixed(2)}</div></div>
-    <div class="metric-box"><div class="mb-label">연간 변동성</div><div class="mb-val">${psa}%</div></div>
-    <div class="metric-box"><div class="mb-label">95% VaR</div><div class="mb-val dn-text">-${mc.var95}%</div></div>
-    <div class="metric-box"><div class="mb-label">수익 확률</div><div class="mb-val up-text">${mc.prob_gain}%</div></div>
+    <div class="metric-box"><div class="mb-label">연간 변동성</div><div class="mb-val">${psa}%</div><div class="mb-sub">포트폴리오</div></div>
+    <div class="metric-box"><div class="mb-label">95% VaR</div><div class="mb-val dn-text">-${mc.var95}%</div><div class="mb-sub">3개월 기준</div></div>
+    <div class="metric-box"><div class="mb-label">수익 확률</div><div class="mb-val up-text">${mc.prob_gain}%</div><div class="mb-sub">3개월 후</div></div>
+    <div class="metric-box"><div class="mb-label">중간값 수익</div><div class="mb-val ${mc.median_ret>=0?'up-text':'dn-text'}">${mc.median_ret>=0?'+':''}${mc.median_ret}%</div></div>
   </div>
   <div class="detail-panel"><div class="detail-title">종목별 비중</div>
-  ${stocks.map((s,i)=>{const ww=Math.round(nw[i]*100);const c=COLORS[s.ticker]||'#4f8ef7';return`<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><div style="display:flex;align-items:center;gap:8px"><div style="width:8px;height:8px;border-radius:50%;background:${c}"></div><span style="font-size:13px;font-weight:500">${s.ticker}</span><span style="font-size:11px;color:var(--text2)">${s.name||''}</span></div><span style="font-size:13px;font-weight:600;color:${c}">${ww}%</span></div><div class="bar52" style="margin-bottom:10px"><div class="bar52-fill" style="width:${ww}%;background:${c}"></div></div>`;}).join('')}
+  ${stocks.map((s,i)=>{const ww=Math.round(nw[i]*100);const c=COLORS[s.ticker]||'#4f8ef7';return`<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><div style="display:flex;align-items:center;gap:8px"><div style="width:8px;height:8px;border-radius:50%;background:${c}"></div><span style="font-size:13px;font-weight:500">${s.ticker}</span><span style="font-size:11px;color:var(--text2)">$${s.price.toFixed(2)}</span></div><span style="font-size:13px;font-weight:600;color:${c}">${ww}%</span></div><div class="bar52" style="margin-bottom:10px"><div class="bar52-fill" style="width:${ww}%;background:${c}"></div></div>`;}).join('')}
   </div>`;
 }
 
@@ -576,14 +594,14 @@ async function refreshAll(){
   const btn=document.querySelector('.refresh-btn');
   btn.textContent='불러오는 중..';btn.disabled=true;
   stockData={};loadStock();
-  setTimeout(()=>{btn.textContent='새로고침';btn.disabled=false;},3000);
+  setTimeout(()=>{btn.textContent='새로고침';btn.disabled=false;},5000);
 }
 
 (async function(){
   initWeightControls();
   await fetchStock('ASTS');
   renderAll();
-  setTimeout(()=>DEFAULT_TICKERS.slice(1).forEach(t=>fetchStock(t)),1500);
+  setTimeout(()=>DEFAULT_TICKERS.slice(1).forEach(t=>fetchStock(t)),2000);
 })();
 </script>
 </body>
